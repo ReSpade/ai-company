@@ -1,0 +1,29 @@
+[project]
+name = "ai-company"
+version = "0.1.0"
+description = "Multi-agent autonomous system for a one-person AI company"
+readme = "README.md"
+authors = [
+    { name = "MKonoha", email = "miyamotokonatsu@outlook.com" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "claude-agent-sdk>=0.1.48",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "typer>=0.15",
+    "rich>=13.0",
+]
+
+[project.scripts]
+ai-company = "ai_company.main:app"
+
+[build-system]
+requires = ["uv_build>=0.9.24,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
