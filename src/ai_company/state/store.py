@@ -1,9 +1,29 @@
 """JSON file-based state persistence for tasks and projects."""
 
-import json
+from datetime import datetime
 from pathlib import Path
 
-from ai_company.state.models import Project, Task, TaskStatus
+from ai_company.state.models import (
+    HumanReview,
+    Project,
+    ReviewDecision,
+    Task,
+    TaskStatus,
+)
+
+# Valid state transitions: from_status -> set of allowed to_statuses
+VALID_TRANSITIONS: dict[TaskStatus, set[TaskStatus]] = {
+    TaskStatus.PENDING: {TaskStatus.IN_PROGRESS},
+    TaskStatus.IN_PROGRESS: {TaskStatus.REVIEW},
+    TaskStatus.REVIEW: {TaskStatus.COMPLETED, TaskStatus.REJECTED},
+    TaskStatus.REJECTED: {TaskStatus.IN_PROGRESS},
+    TaskStatus.APPROVED: {TaskStatus.COMPLETED},
+    TaskStatus.COMPLETED: set(),
+}
+
+
+class InvalidTransition(Exception):
+    pass
 
 
 class StateStore:
@@ -20,6 +40,52 @@ class StateStore:
     def save_task(self, task: Task) -> None:
         path = self.tasks_dir / f"{task.id}.json"
         path.write_text(task.model_dump_json(indent=2))
+
+    def transition_task(
+        self,
+        task_id: str,
+        to_status: TaskStatus,
+        *,
+        feedback: str = "",
+    ) -> Task:
+        """Transition a task to a new status with validation.
+
+        Returns the updated task, or raises InvalidTransition / KeyError.
+        """
+        task = self.load_task(task_id)
+        if task is None:
+            raise KeyError(f"Task '{task_id}' not found")
+
+        allowed = VALID_TRANSITIONS.get(task.status, set())
+        if to_status not in allowed:
+            raise InvalidTransition(
+                f"Cannot transition {task_id} from {task.status.value} to {to_status.value}. "
+                f"Allowed: {', '.join(s.value for s in allowed) or 'none'}"
+            )
+
+        # Record human review decisions
+        if task.status == TaskStatus.REVIEW:
+            decision = (
+                ReviewDecision.APPROVED
+                if to_status == TaskStatus.COMPLETED
+                else ReviewDecision.REJECTED
+            )
+            task.reviews.append(
+                HumanReview(
+                    decision=decision,
+                    feedback=feedback,
+                    iteration=task.iteration,
+                )
+            )
+
+        # Bump iteration on re-run after rejection
+        if task.status == TaskStatus.REJECTED and to_status == TaskStatus.IN_PROGRESS:
+            task.iteration += 1
+
+        task.status = to_status
+        task.updated_at = datetime.now()
+        self.save_task(task)
+        return task
 
     def load_task(self, task_id: str) -> Task | None:
         path = self.tasks_dir / f"{task_id}.json"

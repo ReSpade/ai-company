@@ -32,6 +32,20 @@ class AgentRole(str, Enum):
     REVIEWER = "reviewer"
 
 
+class ReviewDecision(str, Enum):
+    APPROVED = "approved"
+    REJECTED = "rejected"
+
+
+class HumanReview(BaseModel):
+    """A human review decision on a task."""
+
+    decision: ReviewDecision
+    feedback: str = ""
+    iteration: int = 1
+    created_at: datetime = Field(default_factory=datetime.now)
+
+
 class AgentResult(BaseModel):
     """Output from an agent's work."""
 
@@ -39,6 +53,7 @@ class AgentResult(BaseModel):
     summary: str
     details: str = ""
     artifacts: list[str] = Field(default_factory=list)
+    iteration: int = 1
     created_at: datetime = Field(default_factory=datetime.now)
 
 
@@ -52,6 +67,8 @@ class Task(BaseModel):
     status: TaskStatus = TaskStatus.PENDING
     assigned_to: AgentRole | None = None
     results: list[AgentResult] = Field(default_factory=list)
+    reviews: list[HumanReview] = Field(default_factory=list)
+    iteration: int = 1
     parent_id: str | None = None
     subtask_ids: list[str] = Field(default_factory=list)
     project_id: str | None = None

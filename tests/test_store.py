@@ -1,14 +1,17 @@
 """Tests for the StateStore."""
 
+import pytest
+
 from ai_company.state.models import (
     AgentResult,
     AgentRole,
     Project,
+    ReviewDecision,
     Task,
     TaskStatus,
     TaskType,
 )
-from ai_company.state.store import StateStore
+from ai_company.state.store import InvalidTransition, StateStore
 
 
 def test_save_and_load_task(tmp_path):
@@ -138,3 +141,117 @@ def test_directories_created(tmp_path):
     store = StateStore(tmp_path)
     assert store.tasks_dir.exists()
     assert store.projects_dir.exists()
+
+
+# --- State transition tests ---
+
+
+def test_transition_review_to_completed(tmp_path):
+    """Approve: REVIEW → COMPLETED with review record."""
+    store = StateStore(tmp_path)
+    store.save_task(
+        Task(id="task-001", title="T", description="D", type=TaskType.FEATURE, status=TaskStatus.REVIEW)
+    )
+    task = store.transition_task("task-001", TaskStatus.COMPLETED, feedback="LGTM")
+    assert task.status == TaskStatus.COMPLETED
+    assert len(task.reviews) == 1
+    assert task.reviews[0].decision == ReviewDecision.APPROVED
+    assert task.reviews[0].feedback == "LGTM"
+
+
+def test_transition_review_to_rejected(tmp_path):
+    """Reject: REVIEW → REJECTED with feedback."""
+    store = StateStore(tmp_path)
+    store.save_task(
+        Task(id="task-001", title="T", description="D", type=TaskType.FEATURE, status=TaskStatus.REVIEW)
+    )
+    task = store.transition_task("task-001", TaskStatus.REJECTED, feedback="Use OAuth")
+    assert task.status == TaskStatus.REJECTED
+    assert len(task.reviews) == 1
+    assert task.reviews[0].decision == ReviewDecision.REJECTED
+    assert task.reviews[0].feedback == "Use OAuth"
+
+
+def test_transition_rejected_to_in_progress_bumps_iteration(tmp_path):
+    """Resume: REJECTED → IN_PROGRESS bumps iteration."""
+    store = StateStore(tmp_path)
+    store.save_task(
+        Task(
+            id="task-001", title="T", description="D",
+            type=TaskType.FEATURE, status=TaskStatus.REJECTED, iteration=1,
+        )
+    )
+    task = store.transition_task("task-001", TaskStatus.IN_PROGRESS)
+    assert task.status == TaskStatus.IN_PROGRESS
+    assert task.iteration == 2
+
+
+def test_transition_invalid_raises(tmp_path):
+    """Cannot skip states (e.g., PENDING → COMPLETED)."""
+    store = StateStore(tmp_path)
+    store.save_task(
+        Task(id="task-001", title="T", description="D", type=TaskType.FEATURE, status=TaskStatus.PENDING)
+    )
+    with pytest.raises(InvalidTransition):
+        store.transition_task("task-001", TaskStatus.COMPLETED)
+
+
+def test_transition_completed_is_terminal(tmp_path):
+    """COMPLETED is a terminal state — no transitions allowed."""
+    store = StateStore(tmp_path)
+    store.save_task(
+        Task(id="task-001", title="T", description="D", type=TaskType.FEATURE, status=TaskStatus.COMPLETED)
+    )
+    with pytest.raises(InvalidTransition):
+        store.transition_task("task-001", TaskStatus.IN_PROGRESS)
+
+
+def test_transition_not_found(tmp_path):
+    store = StateStore(tmp_path)
+    with pytest.raises(KeyError):
+        store.transition_task("no-such-task", TaskStatus.COMPLETED)
+
+
+def test_full_approve_lifecycle(tmp_path):
+    """Full happy path: PENDING → IN_PROGRESS → REVIEW → COMPLETED."""
+    store = StateStore(tmp_path)
+    store.save_task(
+        Task(id="task-001", title="T", description="D", type=TaskType.FEATURE)
+    )
+    task = store.transition_task("task-001", TaskStatus.IN_PROGRESS)
+    assert task.status == TaskStatus.IN_PROGRESS
+
+    task = store.transition_task("task-001", TaskStatus.REVIEW)
+    assert task.status == TaskStatus.REVIEW
+
+    task = store.transition_task("task-001", TaskStatus.COMPLETED)
+    assert task.status == TaskStatus.COMPLETED
+    assert len(task.reviews) == 1
+    assert task.reviews[0].decision == ReviewDecision.APPROVED
+
+
+def test_reject_and_resume_lifecycle(tmp_path):
+    """Reject → resume → re-review → approve lifecycle."""
+    store = StateStore(tmp_path)
+    store.save_task(
+        Task(id="task-001", title="T", description="D", type=TaskType.FEATURE, status=TaskStatus.REVIEW)
+    )
+
+    # Reject
+    task = store.transition_task("task-001", TaskStatus.REJECTED, feedback="Fix auth")
+    assert task.iteration == 1
+    assert task.reviews[0].feedback == "Fix auth"
+
+    # Resume (bumps iteration)
+    task = store.transition_task("task-001", TaskStatus.IN_PROGRESS)
+    assert task.iteration == 2
+
+    # Agent re-runs → back to review
+    task = store.transition_task("task-001", TaskStatus.REVIEW)
+
+    # Approve
+    task = store.transition_task("task-001", TaskStatus.COMPLETED, feedback="Good now")
+    assert task.status == TaskStatus.COMPLETED
+    assert task.iteration == 2
+    assert len(task.reviews) == 2
+    assert task.reviews[1].decision == ReviewDecision.APPROVED

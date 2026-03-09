@@ -16,12 +16,14 @@ from ai_company.logging import setup_logging
 from ai_company.state.models import (
     AgentResult,
     AgentRole,
+    HumanReview,
     Project,
+    ReviewDecision,
     Task,
     TaskStatus,
     TaskType,
 )
-from ai_company.state.store import StateStore
+from ai_company.state.store import InvalidTransition, StateStore
 
 app = typer.Typer(
     name="ai-company",
@@ -90,6 +92,7 @@ async def _run_task(
         agent=AgentRole.ORCHESTRATOR,
         summary=task_description[:200],
         details="\n".join(collected_text),
+        iteration=task.iteration,
     )
     task.results.append(agent_result)
     task.status = TaskStatus.REVIEW
@@ -105,10 +108,13 @@ async def _run_task(
     console.print()
     console.print(
         Panel(
-            f"[green]Task {task.id} completed.[/green]  "
+            f"[yellow]Task {task.id} ready for review.[/yellow]  "
             f"Cost: ${task.cost_usd or 0:.4f}  "
-            f"Duration: {(task.duration_ms or 0) / 1000:.1f}s",
-            border_style="green",
+            f"Duration: {(task.duration_ms or 0) / 1000:.1f}s\n\n"
+            f"Next: [bold]ai-company tasks show {task.id}[/bold] → "
+            f"[bold]ai-company tasks approve {task.id}[/bold] or "
+            f"[bold]ai-company tasks reject {task.id} -r \"reason\"[/bold]",
+            border_style="yellow",
         )
     )
 
@@ -258,10 +264,182 @@ def tasks_show(
     if task.results:
         console.print(f"\n  [bold]Results ({len(task.results)}):[/bold]")
         for i, r in enumerate(task.results, 1):
-            console.print(f"\n  --- Result {i} ({r.agent.value}) ---")
+            console.print(f"\n  --- Result {i} ({r.agent.value}, iteration {r.iteration}) ---")
             console.print(f"  {r.summary}")
             if r.artifacts:
                 console.print(f"  Artifacts: {', '.join(r.artifacts)}")
+
+    if task.reviews:
+        console.print(f"\n  [bold]Review History ({len(task.reviews)}):[/bold]")
+        for i, rv in enumerate(task.reviews, 1):
+            decision_color = "green" if rv.decision == ReviewDecision.APPROVED else "red"
+            console.print(
+                f"\n  --- Review {i} (iteration {rv.iteration}) ---"
+            )
+            console.print(
+                f"  Decision: [{decision_color}]{rv.decision.value}[/{decision_color}]"
+            )
+            if rv.feedback:
+                console.print(f"  Feedback: {rv.feedback}")
+            console.print(f"  Date: {rv.created_at.strftime('%Y-%m-%d %H:%M:%S')}")
+
+
+# ── tasks approve / reject / resume ──────────────────────────────────────
+
+
+@tasks_app.command("approve")
+def tasks_approve(
+    task_id: str = typer.Argument(help="Task ID to approve"),
+    feedback: str = typer.Option("", "--feedback", "-f", help="Optional approval note"),
+) -> None:
+    """Approve a task in REVIEW status → COMPLETED."""
+    store = _get_store()
+    try:
+        task = store.transition_task(task_id, TaskStatus.COMPLETED, feedback=feedback)
+    except KeyError:
+        console.print(f"[red]Task '{task_id}' not found.[/red]")
+        raise typer.Exit(1)
+    except InvalidTransition as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+
+    console.print(
+        f"[green]Task {task.id} approved and completed (iteration {task.iteration}).[/green]"
+    )
+
+
+@tasks_app.command("reject")
+def tasks_reject(
+    task_id: str = typer.Argument(help="Task ID to reject"),
+    reason: str = typer.Option(..., "--reason", "-r", help="Reason for rejection / change request"),
+) -> None:
+    """Reject a task in REVIEW status with feedback → REJECTED."""
+    store = _get_store()
+    try:
+        task = store.transition_task(task_id, TaskStatus.REJECTED, feedback=reason)
+    except KeyError:
+        console.print(f"[red]Task '{task_id}' not found.[/red]")
+        raise typer.Exit(1)
+    except InvalidTransition as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+
+    console.print(
+        f"[yellow]Task {task.id} rejected (iteration {task.iteration}).[/yellow]"
+    )
+    console.print(f"  Feedback: {reason}")
+    console.print(f"  Run [bold]ai-company tasks resume {task.id}[/bold] to re-run with feedback.")
+
+
+@tasks_app.command("resume")
+def tasks_resume(
+    task_id: str = typer.Argument(help="Task ID to resume after rejection"),
+    project: str | None = typer.Option(
+        None, "--project", "-p", help="Project directory to work in"
+    ),
+) -> None:
+    """Re-run a REJECTED task with accumulated human feedback."""
+    settings = Settings()
+    store = _get_store(settings)
+
+    task = store.load_task(task_id)
+    if task is None:
+        console.print(f"[red]Task '{task_id}' not found.[/red]")
+        raise typer.Exit(1)
+
+    if task.status != TaskStatus.REJECTED:
+        console.print(
+            f"[red]Task '{task_id}' is {task.status.value}, not rejected. "
+            f"Only rejected tasks can be resumed.[/red]"
+        )
+        raise typer.Exit(1)
+
+    # Build feedback context from all rejection reviews
+    feedback_lines = []
+    for rv in task.reviews:
+        if rv.decision == ReviewDecision.REJECTED and rv.feedback:
+            feedback_lines.append(f"- Iteration {rv.iteration}: {rv.feedback}")
+
+    feedback_context = "\n".join(feedback_lines)
+
+    # Transition to IN_PROGRESS (bumps iteration)
+    task = store.transition_task(task_id, TaskStatus.IN_PROGRESS)
+
+    console.print(
+        Panel(
+            f"Resuming: {task.description}\n\n"
+            f"[bold]Human Feedback:[/bold]\n{feedback_context}",
+            title=f"Task {task.id} (iteration {task.iteration})",
+            border_style="blue",
+        )
+    )
+
+    # Re-run with feedback injected into the prompt
+    prompt = (
+        f"{task.description}\n\n"
+        f"## Human Feedback from Previous Iterations\n\n"
+        f"The CEO reviewed previous work and provided the following feedback. "
+        f"Address ALL points:\n\n{feedback_context}"
+    )
+
+    asyncio.run(
+        _resume_task(task, prompt, settings, project)
+    )
+
+
+async def _resume_task(
+    task: Task,
+    prompt: str,
+    settings: Settings,
+    project_dir: str | None,
+) -> None:
+    setup_logging(settings.log_level, settings.data_dir / "logs")
+    store = _get_store(settings)
+
+    options = create_orchestrator_options(
+        task=prompt,
+        settings=settings,
+        project_dir=project_dir,
+    )
+
+    collected_text: list[str] = []
+    result_msg: ResultMessage | None = None
+
+    async for message in query(prompt=prompt, options=options):
+        if isinstance(message, AssistantMessage):
+            for block in message.content:
+                if isinstance(block, TextBlock):
+                    console.print(block.text)
+                    collected_text.append(block.text)
+        elif isinstance(message, ResultMessage):
+            result_msg = message
+
+    agent_result = AgentResult(
+        agent=AgentRole.ORCHESTRATOR,
+        summary=task.description[:200],
+        details="\n".join(collected_text),
+        iteration=task.iteration,
+    )
+    task.results.append(agent_result)
+    task.status = TaskStatus.REVIEW
+    task.updated_at = datetime.now()
+
+    if result_msg:
+        task.cost_usd = (task.cost_usd or 0) + (result_msg.total_cost_usd or 0)
+        task.duration_ms = (task.duration_ms or 0) + (result_msg.duration_ms or 0)
+        task.session_id = result_msg.session_id
+
+    store.save_task(task)
+
+    console.print()
+    console.print(
+        Panel(
+            f"[green]Task {task.id} iteration {task.iteration} complete.[/green]  "
+            f"Cost: ${task.cost_usd or 0:.4f}  "
+            f"Awaiting review: [bold]ai-company tasks approve {task.id}[/bold]",
+            border_style="yellow",
+        )
+    )
 
 
 # ── init-project ─────────────────────────────────────────────────────────

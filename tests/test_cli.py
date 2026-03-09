@@ -5,7 +5,7 @@ import json
 from typer.testing import CliRunner
 
 from ai_company.main import app
-from ai_company.state.models import Project, Task, TaskStatus, TaskType
+from ai_company.state.models import Project, ReviewDecision, Task, TaskStatus, TaskType
 from ai_company.state.store import StateStore
 
 runner = CliRunner()
@@ -85,3 +85,93 @@ def test_init_project_duplicate(tmp_path, monkeypatch):
     runner.invoke(app, ["init-project", "dup"])
     result = runner.invoke(app, ["init-project", "dup"])
     assert result.exit_code == 1
+
+
+# ── approve / reject / resume CLI tests ──────────────────────────────────
+
+
+def test_tasks_approve(tmp_path, monkeypatch):
+    monkeypatch.setenv("AI_COMPANY_DATA_DIR", str(tmp_path))
+    store = StateStore(tmp_path)
+    store.save_task(
+        Task(id="task-001", title="T", description="D", type=TaskType.FEATURE, status=TaskStatus.REVIEW)
+    )
+    result = runner.invoke(app, ["tasks", "approve", "task-001"])
+    assert result.exit_code == 0
+    assert "approved" in result.output
+
+    # Verify state persisted
+    task = store.load_task("task-001")
+    assert task.status == TaskStatus.COMPLETED
+    assert len(task.reviews) == 1
+
+
+def test_tasks_approve_with_feedback(tmp_path, monkeypatch):
+    monkeypatch.setenv("AI_COMPANY_DATA_DIR", str(tmp_path))
+    store = StateStore(tmp_path)
+    store.save_task(
+        Task(id="task-001", title="T", description="D", type=TaskType.FEATURE, status=TaskStatus.REVIEW)
+    )
+    result = runner.invoke(app, ["tasks", "approve", "task-001", "-f", "Ship it!"])
+    assert result.exit_code == 0
+    task = store.load_task("task-001")
+    assert task.reviews[0].feedback == "Ship it!"
+
+
+def test_tasks_approve_wrong_status(tmp_path, monkeypatch):
+    monkeypatch.setenv("AI_COMPANY_DATA_DIR", str(tmp_path))
+    store = StateStore(tmp_path)
+    store.save_task(
+        Task(id="task-001", title="T", description="D", type=TaskType.FEATURE, status=TaskStatus.PENDING)
+    )
+    result = runner.invoke(app, ["tasks", "approve", "task-001"])
+    assert result.exit_code == 1
+    assert "Cannot transition" in result.output
+
+
+def test_tasks_approve_not_found(tmp_path, monkeypatch):
+    monkeypatch.setenv("AI_COMPANY_DATA_DIR", str(tmp_path))
+    result = runner.invoke(app, ["tasks", "approve", "no-such-task"])
+    assert result.exit_code == 1
+    assert "not found" in result.output
+
+
+def test_tasks_reject(tmp_path, monkeypatch):
+    monkeypatch.setenv("AI_COMPANY_DATA_DIR", str(tmp_path))
+    store = StateStore(tmp_path)
+    store.save_task(
+        Task(id="task-001", title="T", description="D", type=TaskType.FEATURE, status=TaskStatus.REVIEW)
+    )
+    result = runner.invoke(app, ["tasks", "reject", "task-001", "-r", "Use OAuth"])
+    assert result.exit_code == 0
+    assert "rejected" in result.output
+    assert "Use OAuth" in result.output
+
+    task = store.load_task("task-001")
+    assert task.status == TaskStatus.REJECTED
+    assert task.reviews[0].feedback == "Use OAuth"
+
+
+def test_tasks_reject_missing_reason(tmp_path, monkeypatch):
+    monkeypatch.setenv("AI_COMPANY_DATA_DIR", str(tmp_path))
+    store = StateStore(tmp_path)
+    store.save_task(
+        Task(id="task-001", title="T", description="D", type=TaskType.FEATURE, status=TaskStatus.REVIEW)
+    )
+    # --reason is required
+    result = runner.invoke(app, ["tasks", "reject", "task-001"])
+    assert result.exit_code != 0
+
+
+def test_tasks_show_with_reviews(tmp_path, monkeypatch):
+    """tasks show displays review history."""
+    monkeypatch.setenv("AI_COMPANY_DATA_DIR", str(tmp_path))
+    store = StateStore(tmp_path)
+    store.save_task(
+        Task(id="task-001", title="T", description="D", type=TaskType.FEATURE, status=TaskStatus.REVIEW)
+    )
+    store.transition_task("task-001", TaskStatus.REJECTED, feedback="Fix tests")
+    result = runner.invoke(app, ["tasks", "show", "task-001"])
+    assert result.exit_code == 0
+    assert "Review History" in result.output
+    assert "Fix tests" in result.output
